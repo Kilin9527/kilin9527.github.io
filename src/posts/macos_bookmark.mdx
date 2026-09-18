@@ -1,0 +1,372 @@
+---
+title: Security-Scoped Bookmark
+date: 2026-09-18
+summary: Security-Scoped Bookmark 的工作原理以及实现方式
+tags: [MacOS, iOS, Security]
+---
+
+# 沙盒持久化访问全解：iOS 与 macOS 的 Security-Scoped Bookmark 实战与对比
+
+在 Apple 平台的沙盒机制（App Sandbox）下，用户通过系统文件选择器授予 App 的文件访问权限通常是**临时性**的。一旦 App 进程退出或重启，权限随即失效。
+
+为了在 App 下次启动时无需用户重复选文件、静默恢复对外部文件的读写能力，官方提供了 **Security-Scoped Bookmark（安全范围书签）** 机制。然而，**iOS 与 macOS 在该 API 的参数要求、权限模型和底层行为上存在显著差异**，混用会导致编译失败或静默权限丢失。
+
+本文将 iOS 和 macOS 平台彻底分开独立讲解，提供各自的原生封装代码，并深入剖析两者异同。
+
+---
+
+## 第一部分：iOS 平台实战
+
+### 1. iOS 核心机制与约束
+
+1. **不可传入 `.withSecurityScope` 选项**：
+   在 iOS SDK 中，`URL.BookmarkCreationOptions.withSecurityScope` 和 `URL.BookmarkResolutionOptions.withSecurityScope` 属于 **`API_UNAVAILABLE(ios)`**。在 iOS 上传入会导致**编译报错**。
+   * **正确逻辑**：iOS 强制全盘沙盒，由 `UIDocumentPickerViewController` 等组件返回的 URL 默认具备安全范围属性。创建和解析书签时，`options` 参数**直接传入空集合 `[]`** 即可。
+2. **必须先激活临时权限再生成书签**：
+   从系统选择器拿到 URL 后，该 URL 处于未激活状态。如果未调用 `startAccessingSecurityScopedResource()` 就直接调用 `url.bookmarkData()`，系统会抛出 `Cocoa Error 257 / 260`（权限不足）。
+3. **处理 `isStale` 时也需申请权限**：
+   当书签过期陈旧（`isStale == true`）需重新生成书签时，同样必须在激活权限的状态下调用 `url.bookmarkData()`。
+
+---
+
+### 2. iOS 独立封装：`IOSBookmarkManager`
+
+```swift
+import Foundation
+
+/// 针对 iOS / iPadOS 平台的安全范围书签管理器
+enum IOSBookmarkManager {
+    nonisolated static var defaultKey: String { "ios_saved_bookmark_data" }
+
+    /// 保存外部文件的安全范围书签
+    /// - Parameters:
+    ///   - url: 已获得安全范围访问权的 URL
+    ///   - key: 存储在 UserDefaults 中的键名
+    nonisolated static func saveBookmark(for url: URL, key: String = defaultKey) throws {
+        // iOS 平台创建书签：options 传入 [] 即可，切勿传入 .withSecurityScope（iOS 不支持）
+        let data = try url.bookmarkData(
+            options: [],
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        UserDefaults.standard.set(data, forKey: key)
+    }
+
+    /// 恢复书签并返回可访问的安全范围 URL
+    /// - Parameter key: 存储在 UserDefaults 中的键名
+    /// - Returns: 解析成功的 URL（使用前仍需调用 startAccessing）
+    nonisolated static func restoreBookmark(key: String = defaultKey) -> URL? {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        
+        var isStale = false
+        // iOS 平台解析书签：options 传入 []
+        guard let url = try? URL(
+            resolvingBookmarkData: data,
+            options: [],
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ) else {
+            return nil
+        }
+
+        // 若书签陈旧（例如文件被重命名或移动），需在已激活权限的环境下重新生成并保存
+        if isStale {
+            if url.startAccessingSecurityScopedResource() {
+                try? saveBookmark(for: url, key: key)
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        return url
+    }
+
+    /// 开启安全资源访问权限
+    @discardableResult
+    nonisolated static func startAccessing(_ url: URL) -> Bool {
+        url.startAccessingSecurityScopedResource()
+    }
+
+    /// 释放安全资源访问权限
+    nonisolated static func stopAccessing(_ url: URL) {
+        url.stopAccessingSecurityScopedResource()
+    }
+
+    /// 清除书签数据
+    nonisolated static func clearBookmark(key: String = defaultKey) {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+}
+```
+
+---
+
+### 3. iOS 完整调用流程
+
+#### 步骤一：在文件选择器回调中安全保存
+
+```swift
+import UIKit
+
+func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+    guard let selectedURL = urls.first else { return }
+
+    // 1. 必须先开启权限，否则生成书签会失败
+    guard selectedURL.startAccessingSecurityScopedResource() else {
+        print("无法获取文件访问权限")
+        return
+    }
+    // 2. 确保在退出作用域时释放临时权限
+    defer { selectedURL.stopAccessingSecurityScopedResource() }
+
+    // 3. 生成并持久化书签
+    do {
+        try IOSBookmarkManager.saveBookmark(for: selectedURL)
+        print("书签保存成功")
+    } catch {
+        print("保存书签失败：\(error.localizedDescription)")
+    }
+}
+```
+
+#### 步骤二：App 重启后恢复并配合 `NSFileCoordinator` 读取
+
+针对外部文件（特别是 iCloud Drive 或第三方文件提供者），推荐搭配 `NSFileCoordinator` 读取，防止产生文件读写冲突：
+
+```swift
+func readPersistedFile() {
+    // 1. 恢复 URL
+    guard let fileURL = IOSBookmarkManager.restoreBookmark() else {
+        print("书签不存在或已彻底失效，请提示用户重新选择文件")
+        return
+    }
+
+    // 2. 申请安全范围权限
+    guard IOSBookmarkManager.startAccessing(fileURL) else {
+        print("激活安全范围权限失败")
+        return
+    }
+    defer { IOSBookmarkManager.stopAccessing(fileURL) }
+
+    // 3. 使用文件协调器进行安全读取
+    var coordinatorError: NSError?
+    let coordinator = NSFileCoordinator()
+    
+    coordinator.coordinate(readingItemAt: fileURL, options: .withoutChanges, error: &coordinatorError) { accessURL in
+        do {
+            let data = try Data(contentsOf: accessURL)
+            print("文件读取成功，大小：\(data.count) 字节")
+        } catch {
+            print("读取内容异常：\(error)")
+        }
+    }
+
+    if let error = coordinatorError {
+        print("文件协调失败：\(error)")
+    }
+}
+```
+
+---
+
+## 第二部分：macOS 平台实战
+
+### 1. macOS 核心机制与约束
+
+1. **必须配置 Entitlements 签名授权**：
+   macOS 的 App Sandbox 默认是可选配置。开启沙盒后，必须在 `.entitlements` 文件中声明用户选定文件的权限，否则即使通过面板选择了文件，也无法生成安全范围书签：
+   ```xml
+   <!-- 必须开启 App Sandbox -->
+   <key>com.apple.security.app-sandbox</key>
+   <true/>
+   <!-- 声明对用户选择的文件的读写权限（若仅需读，设为 readonly 对应 key） -->
+   <key>com.apple.security.files.user-selected.read-write</key>
+   <true/>
+   ```
+2. **必须显式指定 `.withSecurityScope` 选项**：
+   在 macOS 下，必须显式在 `bookmarkData` 中传递 `options: .withSecurityScope`，否则生成的只是普通书签（常规 Alias），在沙盒重启后无法突破权限壁垒。
+3. **支持只读限制（最小权限原则）**：
+   在创建书签时，macOS 支持传入 `.securityScopeAllowOnlyReadAccess`，限制即使原文件具备写权限，恢复出的书签也仅具备读取权限。
+
+---
+
+### 2. macOS 独立封装：`MacOSBookmarkManager`
+
+```swift
+import Foundation
+
+/// 针对 macOS App Sandbox 平台的安全范围书签管理器
+enum MacOSBookmarkManager {
+    nonisolated static var defaultKey: String { "macos_saved_bookmark_data" }
+
+    /// 保存外部文件/目录的安全范围书签
+    /// - Parameters:
+    ///   - url: 用户选择的 URL
+    ///   - key: 存储在 UserDefaults 中的键名
+    ///   - readonly: 是否仅请求只读安全权限
+    nonisolated static func saveBookmark(for url: URL, key: String = defaultKey, readonly: Bool = false) throws {
+        var options: URL.BookmarkCreationOptions = [.withSecurityScope]
+        if readonly {
+            options.insert(.securityScopeAllowOnlyReadAccess)
+        }
+
+        let data = try url.bookmarkData(
+            options: options,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        UserDefaults.standard.set(data, forKey: key)
+    }
+
+    /// 恢复书签并解析出安全范围 URL
+    /// - Parameter key: 存储在 UserDefaults 中的键名
+    /// - Returns: 解析成功的 URL（使用前仍需调用 startAccessing）
+    nonisolated static func restoreBookmark(key: String = defaultKey) -> URL? {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+
+        var isStale = false
+        // macOS 解析必须传入 .withSecurityScope
+        guard let url = try? URL(
+            resolvingBookmarkData: data,
+            options: .withSecurityScope,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ) else {
+            return nil
+        }
+
+        // 若书签已过期，在激活权限作用域下重新持久化
+        if isStale {
+            if url.startAccessingSecurityScopedResource() {
+                try? saveBookmark(for: url, key: key)
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        return url
+    }
+
+    /// 激活安全范围资源访问
+    @discardableResult
+    nonisolated static func startAccessing(_ url: URL) -> Bool {
+        url.startAccessingSecurityScopedResource()
+    }
+
+    /// 释放安全范围资源访问
+    nonisolated static func stopAccessing(_ url: URL) {
+        url.stopAccessingSecurityScopedResource()
+    }
+
+    /// 清理本地书签记录
+    nonisolated static func clearBookmark(key: String = defaultKey) {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+}
+```
+
+---
+
+### 3. macOS 完整调用流程
+
+#### 步骤一：通过 `NSOpenPanel` 选取并保存
+
+```swift
+import AppKit
+
+func selectAndSaveFile() {
+    let openPanel = NSOpenPanel()
+    openPanel.canChooseFiles = true
+    openPanel.canChooseDirectories = true
+    openPanel.allowsMultipleSelection = false
+
+    openPanel.begin { response in
+        guard response == .OK, let selectedURL = openPanel.url else { return }
+
+        // NSOpenPanel 返回的 URL 在当前面板作用域内有效
+        // 但生成持久化 Security-Scoped Bookmark 建议成对包裹 start/stop
+        guard selectedURL.startAccessingSecurityScopedResource() else {
+            print("无法获取所选路径权限")
+            return
+        }
+        defer { selectedURL.stopAccessingSecurityScopedResource() }
+
+        do {
+            try MacOSBookmarkManager.saveBookmark(for: selectedURL)
+            print("macOS 书签保存成功")
+        } catch {
+            print("生成书签失败：\(error.localizedDescription)")
+        }
+    }
+}
+```
+
+#### 步骤二：进程重启后恢复并读取
+
+```swift
+func readPersistedFileOnMac() {
+    // 1. 解析持久化书签
+    guard let fileURL = MacOSBookmarkManager.restoreBookmark() else {
+        print("书签不存在或已失效，需重新弹出 NSOpenPanel 引导选择")
+        return
+    }
+
+    // 2. 激活安全作用域
+    guard MacOSBookmarkManager.startAccessing(fileURL) else {
+        print("激活安全范围资源失败")
+        return
+    }
+    defer { MacOSBookmarkManager.stopAccessing(fileURL) }
+
+    // 3. 执行文件读写
+    do {
+        let content = try String(contentsOf: fileURL, encoding: .utf8)
+        print("读取文件内容成功：\(content.prefix(100))...")
+    } catch {
+        print("文件操作失败：\(error)")
+    }
+}
+```
+
+---
+
+## 第三部分：iOS 与 macOS 平台差异深度对比
+
+| 对比维度 | iOS / iPadOS | macOS (App Sandbox) |
+| :--- | :--- | :--- |
+| **沙盒机制** | 强制全局沙盒，无法关闭 | 默认未开启，需在工程中配置开启 App Sandbox |
+| **创建书签 Options** | **必须为 `[]`**（空集合，传入 `.withSecurityScope` 直接编译报错） | **必须显式指定 `.withSecurityScope`** |
+| **解析书签 Options** | **必须为 `[]`**（空集合） | **必须显式指定 `.withSecurityScope`** |
+| **最小权限支持** | 不支持在生成时设置只读属性 | 支持添加 `.securityScopeAllowOnlyReadAccess` |
+| **Entitlements 依赖** | 无需额外文件授权字段，选择器系统内置授权 | 必须显式配置 `com.apple.security.files.user-selected.read-write` |
+| **交互组件** | `UIDocumentPickerViewController` / `UIDocumentBrowserViewController` | `NSOpenPanel` / `NSSavePanel` |
+| **文档范围书签** *(Document-scoped)* | 不原生支持该机制 | **支持**（允许书签随特定文档文件分发与跨机器流转） |
+| **应用扩展 / App Group 共享** | 书签数据跨进程还原存在隔离限制，外部文件通常建议导入 App Group 共享目录中访问 | 若配置相同 App Group 和对应 Entitlements，可按沙盒规则共享访问 |
+
+### 核心差异详解
+
+1. **为什么 iOS 不能传 `.withSecurityScope`？**
+   在 iOS 早期，所有文件系统访问都是完全封闭的，直到 iOS 8 引入 Document Picker。Apple 在底层直接把“通过系统选择器获取的外部 URL”默认赋予了安全作用域，因此在设计 iOS 的 SDK API 时，直接省去了该选项参数，并在 Objective-C / Swift 标头中明确将此枚举值标记为 iOS 不可用。而在 macOS 上，存在沙盒 App 与非沙盒 App、普通 Finder 别名（Alias）与沙盒书签的并存场景，因此必须显式传入该参数作为区分。
+2. **文档范围书签（Document-Scoped Bookmark）的独占性**：
+   macOS 支持将对某个外部资源（如图片素材）的访问权限绑定到特定的“工程文档”（如 `.psd` 或 自定义项目包）中。其他打开该文档的用户只要在受信任流程下，同样能获得关联资源的读写权。而 iOS 的书签仅能实现“当前 App 本身对该外部文件的持久化记录”。
+
+---
+
+## 第四部分：核心最佳实践与避坑要点
+
+1. **引用计数配对（避免权限泄漏或过早失效）**：
+   `startAccessingSecurityScopedResource()` 与 `stopAccessingSecurityScopedResource()` 采用内部引用计数。
+   * 每次 `startAccessing` 返回 `true` 后，必须保证对应一次 `stopAccessing`。
+   * 必须严格使用 Swift 的 `defer { ... }` 语句包裹释放逻辑，防止因为中间代码抛出 `throw` 或提前 `return` 造成资源句柄泄漏。
+2. **`isStale` 状态闭环**：
+   文件如果被系统移入其他本地快照目录、或者文件名被用户通过系统文件管理器微调，`URL(resolvingBookmarkData:...)` 仍有可能解析成功，但会将 `isStale` 置为 `true`。此时**必须在当前已开启权限的前提下重新生成书签并覆写旧数据**，否则下次冷启动该书签极大概率会直接失效返回 `nil`。
+3. **优先使用 `NSFileCoordinator` 进行 I/O 操作**：
+   用户选中的文件很有可能存储在 iCloud Drive、Dropbox、OneDrive 等云同步盘中。简单的 `Data(contentsOf:)` 可能会因为文件尚未完全下载本地或正在被系统同步守护进程占用而发生阻塞甚至 Crash。使用 `NSFileCoordinator` 能确保在读取时云文件被按需拉取并保证进程间排他安全。
+
+---
+
+## 第五部分：总结
+
+Security-Scoped Bookmark 是 iOS 沙盒体系下，持久化外部文件访问权限的**唯一官方合规方案**。它既保证了系统的隐私安全，又解决了用户重复选择文件的体验问题。
+
+* **在 iOS 上开发时**：谨记 `options: []` 原则，在选择器代理中先 `startAccessing` 再提取 Bookmark，绝不碰 macOS 专属的枚举值；
+* **在 macOS 上开发时**：切记配齐 Entitlements 签名，严格携带 `.withSecurityScope` 选项生成和解析；
+* **业务生命周期内**：时刻遵循“成对 start/stop”、“defer 释放”、“协调器安全读写”和“及时修正 stale 书签”的四项基本准则，即可在两个平台上构建出稳健可靠的外部文件持久化访问系统。
